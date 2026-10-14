@@ -4,6 +4,16 @@ Five models (LogReg, RF, KNN, SVC, ConvLSTM) on two feature sets, evaluated with
 same patient-level folds. Results are already committed in `results/`; rerun only if
 the features, folds or models change. Commands are run from the repo root.
 
+## Requirements
+
+- **Python 3.11** and the project's own dependencies (`pip install -e .`, see `pyproject.toml`).
+- **PyTorch 2.2.2** for the ConvLSTM (`run_convlstm.py`). The other four models do not need it.
+- **numpy 2.x**: keep it. Do not downgrade numpy to suit PyTorch (see the note below).
+
+Versions the committed results were produced with: Python 3.11.9, torch 2.2.2,
+numpy 2.4.6, scipy 1.17.1, pandas 3.0.6, scikit-learn 1.9.1, mne 1.13.2,
+PyWavelets 1.9.0, pyarrow 26.0.0, matplotlib 3.11.2.
+
 ## 1. Environment
 
 ```bash
