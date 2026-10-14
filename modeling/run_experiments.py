@@ -50,6 +50,17 @@ def evaluate(held_out: pd.DataFrame, feature_set: str, model_name: str, fold: in
     return row
 
 
+def save_cv_rows(rows: list[dict], out_dir: Path) -> None:
+    """Write rows to out_dir/cv_auroc.csv, replacing earlier rows with the same (feature_set, model, fold)."""
+    cv_path = out_dir / "cv_auroc.csv"
+    new = pd.DataFrame(rows)
+    if cv_path.exists():
+        old = pd.read_csv(cv_path, float_precision="round_trip")   # exact, so kept rows are rewritten unchanged
+        old = old[~old.set_index(KEY).index.isin(new.set_index(KEY).index)]
+        new = pd.concat([old, new])
+    new.sort_values(KEY).to_csv(cv_path, index=False)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--models", nargs="+", default=MODEL_ORDER, choices=MODEL_ORDER)
@@ -90,14 +101,7 @@ def main() -> None:
             pd.concat(predictions).sort_values(["subject_id", "start_s"]).to_parquet(out, index=False)
         print(f"{model_name} done in {(time.time() - t_model) / 60:.1f} min\n", flush=True)
 
-        # Save after each model so finished results survive an interruption.
-        cv_path = args.out_dir / "cv_auroc.csv"
-        new = pd.DataFrame(rows)
-        if cv_path.exists():
-            old = pd.read_csv(cv_path)
-            old = old[~old.set_index(KEY).index.isin(new.set_index(KEY).index)]
-            new = pd.concat([old, new])
-        new.sort_values(KEY).to_csv(cv_path, index=False)
+        save_cv_rows(rows, args.out_dir)   # after each model, so finished results survive an interruption
 
     summary = pd.DataFrame(rows).groupby(["feature_set", "model"], sort=False)[["auroc", "auprc"]].agg(["mean", "std"])
     print(summary.round(3).to_string())

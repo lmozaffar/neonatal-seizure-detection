@@ -2,6 +2,7 @@
 
     .venv/bin/python scripts/build_feature_table.py                  # all 79 recordings
     .venv/bin/python scripts/build_feature_table.py --subjects 1 57  # a subset
+    .venv/bin/python scripts/build_feature_table.py --channel-features  # also save per-channel features
 
 For each recording: load -> preprocess -> make_windows -> assess_windows (quality)
 -> label_windows -> extract_features. Nothing in helsinki/ is changed or
@@ -10,6 +11,14 @@ reimplemented; this script only calls it and stacks the results.
 Output: data/processed/feature_table.parquet, one row per 12 s window, and
 data/processed/feature_columns.json listing the columns of each feature set.
 Recordings that fail are logged to data/processed/build_log.txt and skipped.
+
+With --channel-features, the per-channel features from extract_features are also
+saved, row-aligned with the table (for models that use the 18-channel layout):
+  channel_features.npy  (n_windows, 18, 58) float32, channels in BIPOLAR_NAMES order,
+                        features in feature_table("secondary") order; the first 55
+                        are the baseline (Temko) set. NaN where undefined.
+  channel_valid.npy     (n_windows, 18) bool: channel has features and is not QC-bad
+  channel_index.parquet subject_id, window_index of each row, for checking alignment
 
 Columns
   identity     subject_id, window_index, start_s, end_s
@@ -65,21 +74,23 @@ FEATURE_SET_1 = summary_columns("baseline")    # 55 Temko features x 3 stats = 1
 FEATURE_SET_2 = summary_columns("secondary")   # + 3 rhythmicity features x 3 stats = 174
 
 
-def process_recording(subject_id: int, check_baseline: bool = False) -> pd.DataFrame:
-    """One recording -> one row per window with the columns described above."""
+def process_recording(subject_id: int, check_baseline: bool = False):
+    """One recording -> (table, channel_feats, channel_valid): one table row per window
+    with the columns described above, and the per-channel features of those windows."""
     raw = load_recording(subject_id, preload=True)
     x, segments = preprocess(raw)
     windows, meta = make_windows(x, subject_id)
     channel_qc, _, meta = assess_windows(raw, x, segments, meta)
     meta = label_windows(meta, load_annotations(subject_id))
-    _, window_feats, _ = extract_features(windows, channel_qc, feature_set="secondary")
+    channel_feats, window_feats, channel_valid = extract_features(windows, channel_qc, feature_set="secondary")
 
     if check_baseline:
         _, base_feats, _ = extract_features(windows, channel_qc, feature_set="baseline")
         pd.testing.assert_frame_equal(base_feats[FEATURE_SET_1], window_feats[FEATURE_SET_1])
 
     table = pd.concat([meta.reset_index(drop=True), window_feats], axis=1)
-    return table[ID_COLUMNS + LABEL_COLUMNS + USABILITY_COLUMNS + METADATA_COLUMNS + FEATURE_SET_2]
+    table = table[ID_COLUMNS + LABEL_COLUMNS + USABILITY_COLUMNS + METADATA_COLUMNS + FEATURE_SET_2]
+    return table, channel_feats.astype(np.float32), channel_valid
 
 
 def main() -> None:
@@ -88,17 +99,19 @@ def main() -> None:
     parser.add_argument("--out", type=Path, default=OUT_DIR / "feature_table.parquet")
     parser.add_argument("--check-baseline", action="store_true",
                         help="also run the baseline feature set and assert it equals the set-1 columns")
+    parser.add_argument("--channel-features", action="store_true",
+                        help="also save per-channel features (channel_features.npy, channel_valid.npy)")
     args = parser.parse_args()
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     log_path = args.out.parent / "build_log.txt"
-    tables, failed = [], []
+    tables, chan_feats, chan_valid, failed = [], [], [], []
     t_all = time.time()
     with open(log_path, "w") as log:
         for i, sid in enumerate(args.subjects, 1):
             t0 = time.time()
             try:
-                table = process_recording(sid, args.check_baseline)
+                table, feats, valid = process_recording(sid, args.check_baseline)
             except Exception as e:
                 failed.append(sid)
                 msg = f"eeg{sid}: FAILED ({type(e).__name__}: {e})"
@@ -106,6 +119,9 @@ def main() -> None:
                 log.write(msg + "\n" + traceback.format_exc() + "\n")
                 continue
             tables.append(table)
+            if args.channel_features:
+                chan_feats.append(feats)
+                chan_valid.append(valid)
             msg = (f"eeg{sid}: {len(table)} windows, {int(table.eligible.sum())} eligible, "
                    f"{int(table.unusable.sum())} unusable, {time.time() - t0:.1f} s")
             print(f"[{i}/{len(args.subjects)}] {msg}", flush=True)
@@ -125,6 +141,11 @@ def main() -> None:
         "rhythmicity_only": [c for c in FEATURE_SET_2 if c not in FEATURE_SET_1],
     }
     (args.out.parent / "feature_columns.json").write_text(json.dumps(columns, indent=1))
+
+    if args.channel_features:
+        np.save(args.out.parent / "channel_features.npy", np.concatenate(chan_feats))
+        np.save(args.out.parent / "channel_valid.npy", np.concatenate(chan_valid))
+        df[["subject_id", "window_index"]].to_parquet(args.out.parent / "channel_index.parquet", index=False)
 
     print(f"\nsaved {args.out} ({len(df)} windows, {df.subject_id.nunique()} subjects) "
           f"in {(time.time() - t_all) / 60:.1f} min")
