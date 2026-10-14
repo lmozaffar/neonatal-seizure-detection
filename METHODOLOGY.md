@@ -582,3 +582,282 @@ proven errors in Temko's original algorithm.
 9. **Model training,** including imputation and scaling inside training folds.
 10. **Final eligibility for training:** how `eligible`, `unusable` and the
    per-channel flags combine.
+
+---
+
+**Modeling (sections 12–20, Esther).** These sections document the window-level models built on the features above.
+Code: `scripts/build_feature_table.py`, `modeling/common.py`, `modeling/models.py`,
+`modeling/run_experiments.py`, `modeling/run_convlstm.py`, `modeling/plot_results.py`;
+results in `results/`. Rerun instructions: `modeling/README.md`. Counts below were
+computed from `data/processed/feature_table.parquet` and the files in `results/`.
+
+## 12. Window table and training set
+
+*Implemented. Provisional (training mask follows §8 and §11.10).*
+
+- **Window table.** `scripts/build_feature_table.py` runs §2–§9 unchanged on all 79
+  recordings and stacks one row per 12 s window into
+  `data/processed/feature_table.parquet`. No recording failed. The eeg1 and eeg57 window
+  and eligibility counts match §5 (1164 / 1000 and 521 / 516). eeg1's eligible labels
+  match §7 (262 positive, 350 negative, 388 ambiguous).
+- **Counts:**
+
+  | | Windows |
+  |---|---|
+  | All windows | 67,025 (79 subjects) |
+  | `label` 1 / 0 / −1 | 8,516 / 53,789 / 4,720 |
+  | Eligible (§5) | 65,504 |
+  | Ineligible | 1,521 (15 of them `label` 1) |
+  | Unusable (§6) | 1, and it is also ineligible (eeg28, window 957, `gap_frac` 0.83) |
+  | **Training mask** | **60,885** (8,501 positive, 52,384 negative), all 79 subjects |
+  | Eligible ambiguous (`label` −1) | 4,619 |
+
+- **Training mask:** `label` ∈ {0, 1} **and** `eligible` **and not** `unusable`
+  (`modeling.common.training_mask`). Since no eligible window is unusable, this is the
+  same set as eligible windows with label 0/1. Ambiguous and ineligible windows are
+  never training targets but are kept and predicted (§17).
+- **Every window is fully annotated:** `label_any_overlap` and `label_binary50` are
+  never −1.
+- **No missing feature values in training windows** (0 NaN over the 174 feature
+  columns). All 1,521 ineligible windows have at least one NaN feature.
+- **Seizure subjects:** 46 subjects have at least one `label` 1 window and 33 have none.
+  §1 counts 47 subjects marked by at least two experts. The difference is **eeg8**:
+  expert A marks 32 s and expert B 73 s, but never the same second, so eeg8 has no
+  consensus second (§7) and no positive window.
+
+## 13. Feature sets for modeling
+
+*Implemented.*
+
+- **Set 1 (baseline):** the 55 Temko features (§9), each summarised across channels
+  by median, max and p75 → **165 columns**.
+- **Set 2 (secondary):** set 1 plus the 3 rhythmicity features `acf_peak`,
+  `acf_peak_lag` and `spectral_peak_prominence` → **174 columns**.
+- **Column lists** are built from `helsinki.features.FEATURE_SETS` and `SUMMARY_STATS`
+  (`modeling.common.FEATURE_SET_1` / `FEATURE_SET_2`), so they follow §9 exactly. They
+  are also written to `data/processed/feature_columns.json`.
+- **Not predictors:** QC flags, `n_valid_channels`, `gap_frac`, `filter_edge` and the
+  annotation counts are metadata (§9).
+- **One feature run.** Features were extracted once with the secondary set. Set 1's
+  columns from that run were checked to be identical to a separate baseline run on
+  eeg1 and eeg57. The 3 extra features are appended after the 55, so the shared ones
+  are computed by the same code.
+- **Per-channel features (ConvLSTM only).** With `--channel-features`, the
+  `(n_windows, 18, 58)` array returned by `extract_features` is also saved
+  (`channel_features.npy`, float32), with `channel_valid` and a row index. On all
+  eligible windows, the median across valid channels reproduces the table's
+  `line_length_median`.
+
+## 14. Patient-level folds
+
+*Implemented. Final for this round of experiments.*
+
+- **Split by patient.** Every window of a subject is in the same fold, so no
+  patient is in both training and test.
+- **Design.** The 46 seizure subjects and the 33 non-seizure subjects are each sorted,
+  shuffled and split into 5 near-equal parts with `KFold(shuffle=True,
+  random_state=0)`, and part *i* of both groups forms fold *i*. The result is stored in
+  `results/folds.csv` and is shared by every model and teammate.
+- **Why not `StratifiedGroupKFold`.** It was tried first. It balances the *share of
+  seizure windows* per fold, which left between 5 and 15 seizure subjects per fold
+  because a few subjects carry many positives. Event-level evaluation (§8) depends on
+  the number of seizure patients, so each fold now gets 9–10.
+- **Folds:**
+
+  | Fold | Subjects | Seizure / non-seizure | Training-mask windows | Positives | Positive share | Ambiguous windows |
+  |---|---|---|---|---|---|---|
+  | 0 | 17 | 10 / 7 | 13,106 | 1,361 | 10.4% | 874 |
+  | 1 | 16 | 9 / 7 | 12,059 | 1,067 | 8.8% | 853 |
+  | 2 | 16 | 9 / 7 | 11,614 | 1,093 | 9.4% | 756 |
+  | 3 | 15 | 9 / 6 | 14,173 | 3,099 | 21.9% | 727 |
+  | 4 | 15 | 9 / 6 | 9,933 | 1,881 | 18.9% | 1,510 |
+
+- **Cost:** the positive share differs by fold (8.8–21.9%), so AUPRC is not
+  comparable across folds (§17).
+- **Leakage check.** The training loops were instrumented. For every model, feature
+  set and fold, zero subjects overlap between training and test, training targets
+  contain no −1, ineligible or unusable windows, and every held-out window is
+  predicted.
+
+## 15. Classical models
+
+*Implemented. Settings chosen in advance, not tuned.*
+
+- **Pipeline.** Every model is `SimpleImputer(strategy="median")` →
+  `StandardScaler()` → classifier (`modeling/models.py`). Imputation and scaling are
+  fit inside each training fold. On fold 0, the stored medians and means were checked
+  to equal the training rows' values and to differ from the full-data values.
+- **Settings:**
+
+  | Model | Classifier and settings |
+  |---|---|
+  | LogReg | `LogisticRegression(class_weight="balanced", max_iter=2000)` |
+  | RF | `RandomForestClassifier(n_estimators=300, min_samples_leaf=5, class_weight="balanced", n_jobs=-1, random_state=0)` |
+  | KNN | `KNeighborsClassifier(n_neighbors=25, n_jobs=-1)`. There is no `class_weight` option, so it trains on the raw ~1:6 imbalance. |
+  | SVC | `SVC(kernel="rbf", class_weight="balanced")`, other parameters at scikit-learn defaults, with negative subsampling (below) |
+
+- **Training data:** training-mask windows of the 4 other folds' subjects, 46,712–50,952
+  windows per fold.
+- **Scores.** `predict_scores` returns `predict_proba[:, 1]` where it exists. SVC has no
+  `probability=True` (about 5× slower), so it returns `decision_function`, an unbounded
+  score. Both are valid for AUROC and AUPRC, but SVC scores are not probabilities.
+- **SVC negative subsampling.** RBF-SVC fit time grew roughly with the square of the
+  training size. Measured on the development laptop (Intel Core i5-1038NG7): 8 s at
+  10,000 windows and 35 s at 20,000, extrapolating to about 3–4 min per fold.
+  `NegativeSubsampler` therefore fits each fold on **all positives plus 20,000 random
+  negatives** (`SVC_MAX_NEGATIVES`, NumPy generator seed 0), 25,402–27,434 windows per
+  fold. Only training is subsampled; every held-out window is scored.
+  `class_weight="balanced"` is computed on the subsample.
+
+## 16. ConvLSTM
+
+*Implemented. Provisional: architecture and settings chosen in advance, not tuned.*
+
+- **Input.** Each target window is a sequence of the **5 previous windows of the same
+  subject plus the target** (6 windows, 30 s of past context at a 6 s stride), oldest
+  first.
+  - Only past windows are used, and a sequence never crosses subjects or folds
+    (checked on all 67,025 windows).
+  - Each step is the per-channel feature grid, 18 bipolar channels × 55 (set 1) or 58
+    (set 2) features, plus one mask input per channel.
+  - Steps before a recording's first window are padding (zeros, mask 0). 395 windows
+    have padded history.
+- **Missing context rule.**
+  - A channel without features (gap, or QC-`bad` per §6) is set to 0 with mask 0.
+  - Ambiguous (−1) windows have real features and are used as context.
+  - Labels are never inputs. Targets are training-mask windows only.
+  - Every held-out window is predicted.
+- **Scaling.** Per feature, a `QuantileTransformer(n_quantiles=1000,
+  output_distribution="normal", subsample=200000, random_state=0)` is fit on the valid
+  channels of the training targets only, then applied to all windows. 0 is therefore the
+  training median. Chosen because powers and energies span orders of magnitude.
+- **Network.**
+  - One ConvLSTM layer; each gate is a `Conv1d` across the 18 channels in montage order
+    (kernel 3, padding 1), with 16 hidden channels.
+  - The last hidden state goes through mean and max pooling over channels, dropout 0.3
+    and a linear output.
+  - 13,921 parameters (set 1) or 14,497 (set 2).
+  - The kernel also spans the joins between montage chains (e.g. P4-O2 next to
+    Fp1-F3), which are not physical neighbours.
+- **Training.**
+  - `BCEWithLogitsLoss` with `pos_weight` = negatives / positives among training targets.
+  - Adam (lr 1e-3, weight decay 1e-4), batch 256, at most 30 epochs.
+  - Early stopping with patience 5 on validation AUROC, restoring the best epoch.
+  - Validation is 20% of the training folds' seizure subjects and 20% of their
+    non-seizure subjects: 12 patients per fold (7 with seizures), never the test fold.
+    These patients are also excluded from the scaling fit.
+  - Seeds: `torch.manual_seed(fold)`, a shuffling generator seeded with the fold, and
+    the NumPy seed for the validation split.
+- **Software.** PyTorch 2.2.2 on CPU (4 threads), the newest PyTorch for Intel Macs.
+  It cannot exchange arrays with numpy 2 directly, so arrays pass through raw bytes
+  (`to_torch` / `to_numpy`). numpy was not downgraded.
+- **Reproducibility.** Verified once: the 5-epoch test run and the full run gave the
+  same set 2 fold 0 result (best epoch 2, AUROC 0.882). Other folds have not been
+  rerun.
+
+## 17. Evaluation
+
+*Implemented: window-level metrics. Planned: event-level metrics (§8).*
+
+- **Predictions.** For each feature set, model and fold, the model is fit on the
+  training folds and scores **every window of the held-out subjects**, including
+  ambiguous and ineligible ones (`results/predictions_<model>_set<N>.parquet`:
+  `subject_id`, `start_s`, `end_s`, `label`, `eligible`, `score`, `fold`; 67,025 rows
+  each, no missing scores).
+- **Scores of ineligible windows are not meaningful.** Their missing features are
+  imputed (classical models) or masked (ConvLSTM), so filter on `eligible`.
+- **Metrics** (`results/cv_auroc.csv`): AUROC (`roc_auc_score`) and AUPRC
+  (`average_precision_score`) per fold, on held-out windows with `label` ∈ {0, 1} and
+  `eligible`.
+  - **Excluded:** ambiguous (−1) windows and ineligible windows. Unusable windows are not
+    filtered separately; the only one is ineligible.
+  - A fold with only one class would be skipped with a warning. None was.
+- **Summary** = mean and sample standard deviation (ddof 1) across the 5 folds.
+  `modeling/plot_results.py` plots it as `results/auroc_bar_chart.png`.
+- **Why AUPRC is per fold only.** AUPRC depends on the positive share, which varies by
+  fold (8.8–21.9%, §14), so it is compared between models within a fold, not across
+  folds.
+- **Not done:** event-level detection against per-second consensus, false detections
+  per hour, smoothing or thresholding, and evaluation on ambiguous windows.
+
+## 18. Results (window level)
+
+*Provisional: window-level only; to be complemented by event-level results.*
+
+Mean ± SD across 5 folds (`results/cv_auroc.csv`):
+
+| Model | AUROC set 1 | AUROC set 2 | AUPRC set 1 | AUPRC set 2 |
+|---|---|---|---|---|
+| LogReg | 0.754 ± 0.065 | 0.761 ± 0.066 | 0.419 ± 0.148 | 0.430 ± 0.153 |
+| RF | 0.782 ± 0.053 | 0.792 ± 0.055 | 0.492 ± 0.100 | 0.511 ± 0.090 |
+| KNN | 0.754 ± 0.038 | 0.760 ± 0.038 | 0.444 ± 0.077 | 0.457 ± 0.069 |
+| SVC | 0.792 ± 0.038 | 0.798 ± 0.041 | 0.523 ± 0.087 | 0.530 ± 0.086 |
+| ConvLSTM | 0.805 ± 0.063 | 0.813 ± 0.059 | 0.569 ± 0.105 | 0.585 ± 0.096 |
+
+AUROC per fold, set 2:
+
+| Model | Fold 0 | Fold 1 | Fold 2 | Fold 3 | Fold 4 |
+|---|---|---|---|---|---|
+| LogReg | 0.857 | 0.727 | 0.798 | 0.694 | 0.728 |
+| RF | 0.867 | 0.763 | 0.781 | 0.725 | 0.822 |
+| KNN | 0.784 | 0.755 | 0.778 | 0.695 | 0.788 |
+| SVC | 0.863 | 0.794 | 0.775 | 0.754 | 0.803 |
+| ConvLSTM | 0.882 | 0.767 | 0.828 | 0.738 | 0.851 |
+
+- **Fold matters more than model.** Fold 0 is easiest and fold 3 hardest for most
+  models, and the fold-to-fold SD (0.04–0.07) exceeds most differences between models.
+- **ConvLSTM has the highest mean** AUROC and AUPRC on both sets. It beats SVC in 7 of
+  10 feature-set × fold pairs and RF in 9 of 10. SVC is higher on fold 1 (both sets) and
+  on fold 3 (set 2).
+- **Set 2 vs set 1:** set 2 has the higher mean for every model (+0.006 to +0.010 AUROC).
+  Per fold, set 2 is higher in 4/5 (LogReg, KNN, SVC), 5/5 (RF) and 3/5 (ConvLSTM).
+  The gain is small relative to the SD and has not been tested for significance.
+- **ConvLSTM training.**
+  - Best epochs ranged from 2 to 16 (7–21 epochs run).
+  - Validation loss ended higher than at epoch 1 in 9 of 10 runs, while training loss fell
+    throughout. The network becomes overconfident on unseen patients; early stopping on
+    validation AUROC keeps the best epoch (`results/convlstm_curves.png`).
+  - Validation AUROC is noisy with 12 patients.
+- **Runtime** (one Intel Core i5-1038NG7 laptop, all 10 fits per model): LogReg 0.8 min,
+  RF 5.9 min, KNN 0.7 min, SVC 14.7 min, ConvLSTM 17.9 min (9.2 + 8.7). Times from the
+  run logs.
+
+## 19. Modeling caveats
+
+- **Window-level only.** AUROC/AUPRC on clean windows are not the primary metric (§8).
+  Event-level results may rank the models differently.
+- **Unequal inputs.** ConvLSTM sees 30 s of past context and all 18 channels
+  separately; the classical models see one window's channel summaries. Part of its
+  advantage may come from the context, not the architecture. Not tested.
+- **Settings not tuned.** All hyperparameters (§15, §16) were fixed in advance. The
+  ConvLSTM fold 0 test result was seen before the full run; nothing was changed after
+  it. Picking the best of 5 models on the same folds is still mildly optimistic.
+- **SVC is trained on a subsample** (all positives + 20,000 negatives), so it uses fewer
+  negatives than the other models.
+- **KNN is not class-weighted.**
+- **Calibration not assessed.** SVC outputs margins, and the other models' probabilities
+  have not been calibrated. Thresholds for detection are not set.
+- **Small seizure population.** 46 seizure subjects in total and 9–10 per test fold.
+  Per-fold results depend strongly on which patients are held out.
+- **QC thresholds** (§6) were calibrated on eeg1 and eeg57. eeg1 is a test subject in
+  fold 4. The flags are not predictors and affect only eligibility and channel
+  validity.
+- **Reproducibility of classical runs not re-verified.** Seeds are fixed (RF
+  `random_state=0`, SVC subsample seed 0), but no repeat run was compared.
+- **Earlier `cv_auroc.csv` rows.** Before a fix to `save_cv_rows` (exact float
+  parsing), rewriting the file could change kept values in the 17th significant digit.
+  The committed file was rebuilt so the 40 classical rows are byte-identical to their
+  first commit.
+
+## 20. Modeling: open items
+
+1. Event-level evaluation (§8): event matching, smoothing and false detections per hour,
+   using the saved predictions.
+2. Decide how ambiguous windows enter evaluation, and report results with them.
+3. A fair context comparison: give the classical models the previous windows'
+   features, to separate the effect of context from the ConvLSTM architecture.
+4. ConvLSTM regularisation: validation loss rises early, so try a lower learning rate,
+   more dropout, or fewer inputs.
+5. Hyperparameter tuning with nested cross-validation, if time allows.
+6. Probability calibration and an operating threshold.
+7. XGBoost (installed, not yet used) as a further classical model.
