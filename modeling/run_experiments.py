@@ -50,9 +50,9 @@ def evaluate(held_out: pd.DataFrame, feature_set: str, model_name: str, fold: in
     return row
 
 
-def save_cv_rows(rows: list[dict], out_dir: Path) -> None:
-    """Write rows to out_dir/cv_auroc.csv, replacing earlier rows with the same (feature_set, model, fold)."""
-    cv_path = out_dir / "cv_auroc.csv"
+def save_cv_rows(rows: list[dict], out_dir: Path, filename: str = "cv_auroc.csv") -> None:
+    """Write rows to out_dir/filename, replacing earlier rows with the same (feature_set, model, fold)."""
+    cv_path = out_dir / filename
     new = pd.DataFrame(rows)
     if cv_path.exists():
         old = pd.read_csv(cv_path, float_precision="round_trip")   # exact, so kept rows are rewritten unchanged
