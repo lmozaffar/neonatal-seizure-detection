@@ -52,7 +52,9 @@ from modeling.plot_results import GRID, SURFACE, TEXT, TEXT_MUTED
 from modeling.run_channel_models import ARMS
 
 MODELS = {"ConvLSTM": "predictions_ConvLSTM_set2.parquet", "SVC": "predictions_SVC_set2.parquet",
-          "RF": "predictions_RF_set2.parquet", **{arm: f"predictions_SVC_{arm}.parquet" for arm in ARMS}}
+          "RF": "predictions_RF_set2.parquet", **{arm: f"predictions_SVC_{arm}.parquet" for arm in ARMS},
+          "RF_leaf20": "predictions_RF_leaf20_set2.parquet", "LightGBM": "predictions_LightGBM_set2.parquet",
+          "LightGBM_ctx": "predictions_LightGBM_ctx_set2.parquet"}
 COMPARISONS = [("E9", "A1", "SVC", "pre-specified"), ("E9", "C0", "SVC", "pre-specified"),
                ("E9", "C1", "SVC", "pre-specified"), ("E9", "S", "SVC", "descriptive"),
                ("E9", "C1", "A1", "descriptive"), ("E9", "C1", "C0", "descriptive"),
