@@ -347,7 +347,7 @@ Both are stored for comparison; −1 means the window is not fully annotated.
 
 ## 8. Evaluation approach
 
-*Planned, not implemented.*
+*Planned here; event-level evaluation is implemented in §21.*
 
 - **Training** uses conservative labels on windows that are eligible and not
   unusable.
@@ -757,7 +757,7 @@ computed from `data/processed/feature_table.parquet` and the files in `results/`
 
 ## 17. Evaluation
 
-*Implemented: window-level metrics. Planned: event-level metrics (§8).*
+*Window-level metrics. Event-level metrics (§8) are in §21.*
 
 - **Predictions.** For each feature set, model and fold, the model is fit on the
   training folds and scores **every window of the held-out subjects**, including
@@ -777,8 +777,8 @@ computed from `data/processed/feature_table.parquet` and the files in `results/`
 - **Why AUPRC is per fold only.** AUPRC depends on the positive share, which varies by
   fold (8.8–21.9%, §14), so it is compared between models within a fold, not across
   folds.
-- **Not done:** event-level detection against per-second consensus, false detections
-  per hour, smoothing or thresholding, and evaluation on ambiguous windows.
+- **Not done here:** event-level detection against per-second consensus, false detections
+  per hour, smoothing or thresholding (since done, §21), and evaluation on ambiguous windows.
 
 ## 18. Results (window level)
 
@@ -852,7 +852,7 @@ AUROC per fold, set 2:
 ## 20. Modeling: open items
 
 1. Event-level evaluation (§8): event matching, smoothing and false detections per hour,
-   using the saved predictions.
+   using the saved predictions. Since done: §21.
 2. Decide how ambiguous windows enter evaluation, and report results with them.
 3. A fair context comparison: give the classical models the previous windows'
    features, to separate the effect of context from the ConvLSTM architecture.
@@ -861,3 +861,243 @@ AUROC per fold, set 2:
 5. Hyperparameter tuning with nested cross-validation, if time allows.
 6. Probability calibration and an operating threshold.
 7. XGBoost (installed, not yet used) as a further classical model.
+
+## 21. Event-level evaluation
+
+*Implements the primary metric of §8.* Code: `modeling/events.py` (shared definitions) and
+`modeling/evaluate_events.py` (every model's results). It uses the saved held-out predictions (§17) and the three
+experts' annotations; nothing is retrained.
+
+**Reference events (protocols).** A second counts only if all three experts annotated it.
+
+| Protocol | Seizure second | Event | False alarm overlaps no | FA/h denominator |
+|---|---|---|---|---|
+| Majority (primary) | at least 2 of 3 experts (our labels, §7) | every run of seizure seconds | reference event | all evaluable hours |
+| Published | all 3 experts | runs of at least 10 s | second marked by any expert | evaluable hours not marked by only 1-2 experts |
+
+The published protocol follows the scoring of the published Helsinki detector (Tapani et al. 2019), except that
+detections stay causal (their centred smoothing and 23 s collar are not used). Seconds marked by an expert but not
+reference seizure are ambiguous: they are not events, and under majority a false alarm that overlaps them still
+counts. Majority: 492 events (278 under 60 s) in 46 patients, 109.7 h. Published: 330 events (157 under 60 s) in 39
+patients, 100.2 h. **Sensitivities under the two protocols are not comparable**: they score different events. Only
+differences between models under the same protocol are model comparisons.
+
+**Causal score timeline.** Second t takes the score of the earliest-ending eligible window that contains it and is
+decided when that window ends (with 12 s windows every 6 s, each window decides its newest 6 s). Ineligible windows
+(§5) are dropped. A second is evaluable when it is annotated and an eligible window scores it.
+
+**Detections and postprocessing**, in this order, all causal:
+1. Smoothing k ∈ {1, 3, 5, 7}: a window's score becomes the mean of the last k eligible windows of the patient.
+2. Threshold: detections are runs of evaluable seconds with score ≥ threshold; a gap ends a run.
+3. Minimum duration D ∈ {0, 12, 18, 24} s: shorter runs are dropped; the alarm is raised at the decision time of a
+   run's D-th second.
+4. Merge gap G ∈ {0, 6, 12, 30} s: a run starting at most G s after the previous one joins its detection, without a
+   new alarm. Merging never flags the seconds in between.
+
+The baseline operating point uses no postprocessing (k = 1, D = 0, G = 0); "postprocessed" chooses among all 64
+combinations.
+
+**Matching (any overlap).** An event is detected when a detection flags one of its seconds; a detection overlapping
+no event is a false alarm (per protocol, above). Latency is the earliest alarm of the detections overlapping an
+event minus its onset, floored at 0. Events with no evaluable second are left out.
+
+**Threshold and postprocessing selection (cross-fitted).** For each held-out fold f and FA/h target (1.0 or 0.5),
+every postprocessing combination gets a threshold chosen on the other 4 folds' held-out predictions: scanning down
+from the highest threshold, the lowest one before their pooled FA/h first exceeds the target. The combination with
+the highest other-fold sensitivity is then chosen (ties: lower other-fold FA/h, then the simpler combination) and
+applied to fold f. Candidate thresholds are 99 quantiles of all folds' scores, dense near the top. Choices are in
+`results/event_selected.csv`. Targets are selection targets, not guarantees: read the realised FA/h.
+
+**This is cross-fitted, not strictly nested.** Fold f's patients are never used to choose fold f's threshold, but
+the other folds' scores come from models trained on fold f's patients, and the candidate grid pools all folds.
+Models being compared share these limits, so comparisons are like for like; absolute numbers may be optimistic.
+
+**Statistics.** Confidence intervals are 95% paired patient-bootstrap intervals: 2,000 resamples of whole patients
+(seed 0), both models on the same resample, nothing chosen again. For E14 (§25) sensitivities are also compared at
+matched FA/h: each model's thresholds are moved along its candidate grid around the chosen ones, and sensitivity is
+read off both curves (interpolated on log FA/h) at the lower of the two realised FA/h, inside every resample too.
+
+**Results** (`results/event_results.csv`, majority, postprocessed, 1 FA/h target): SVC 33.5% (165 of 492) at 1.003
+FA/h, ConvLSTM 30.9% at 0.985, RF 26.6% at 1.222. Without postprocessing: SVC 25.6% at 0.675 FA/h, ConvLSTM 19.3%
+at 0.219, RF 20.1% at 0.784. The window-level ranking (§18, ConvLSTM first) does not carry over to events.
+
+**Limitations.** Cross-fitted rather than nested selection (above); the reference depends on expert agreement, and
+no events were adjudicated; ambiguous seconds are not scored as events, so a detector is neither rewarded nor
+penalised for them under majority except through false alarms; one dataset, no external validation.
+
+## 22. Why seizures are missed (E4)
+
+*Descriptive; nothing is chosen.* Code: `modeling/error_analysis.py`. Results: `results/missed_seizures.csv`,
+`results/sensitivity_by_duration.csv` (chart: `sensitivity_by_duration.png`).
+
+For ConvLSTM, SVC and RF (feature set 2), majority protocol, 1 FA/h target, at both operating points of §21, each
+missed event is placed in the first category it fits:
+
+- **crossed, too short**: its score reached the threshold, but no run lasted the minimum duration;
+- **near miss**: its peak score is at or above the 99th percentile of background seconds;
+- **elevated**: peak between the 90th and 99th percentile;
+- **low**: peak below the 90th percentile, so the model scores the seizure like background.
+
+Background seconds are evaluable seconds marked by no expert, in the held-out fold; using that fold's own scores is
+for description only.
+
+| Missed events, postprocessed | ConvLSTM | SVC | RF |
+|---|---|---|---|
+| crossed, too short | 11.2% | 12.8% | 4.4% |
+| near miss (≥ p99) | 2.1% | 0.9% | 2.5% |
+| elevated (p90-p99) | 30.6% | 33.0% | 38.8% |
+| low (< p90) | **56.2%** | **53.2%** | **54.3%** |
+
+| Sensitivity, postprocessed | < 12 s | 12-30 s | 30-60 s | 60-120 s | ≥ 120 s |
+|---|---|---|---|---|---|
+| Events | 20 | 166 | 92 | 93 | 121 |
+| ConvLSTM | 10.0% | 6.0% | 19.6% | 52.7% | 60.3% |
+| SVC | 20.0% | 13.9% | 20.7% | 49.5% | 60.3% |
+| RF | 0.0% | 8.4% | 13.0% | 38.7% | 57.0% |
+
+**Conclusion.** More than half of the missed seizures never score above the 90th percentile of background, so the
+limit is how well the scores separate seizures from background, not the postprocessing. Short seizures are rarely
+detected. **Limitations:** descriptive only, one operating point per model, majority protocol only, and the
+categories depend on the background of each held-out fold.
+
+## 23. Label coverage of short seizures (E5)
+
+*Descriptive; uses no scores.* Code: `modeling/label_analysis.py`. Result: `results/label_coverage.csv`.
+
+Question: are short seizures missed because they have no positive training windows? For every majority reference
+event (§21): the windows overlapping it, how many are ambiguous (label -1), how many are positive training windows
+(label 1 and eligible; label 1 needs at least 6 of a window's 12 s to be consensus seizure, §7), and the share of its
+seconds those positive windows cover.
+
+| Duration | Events | With a positive training window | Median positive windows | Mean share of seconds covered | Ambiguous share of windows |
+|---|---|---|---|---|---|
+| < 12 s | 20 | 18 | 2 | 86.0% | 51.6% |
+| 12-30 s | 166 | 166 | 4 | 99.9% | 31.6% |
+| 30-60 s | 92 | 92 | 7 | 99.7% | 18.2% |
+| 60-120 s | 93 | 93 | 15 | 99.7% | 9.7% |
+| ≥ 120 s | 121 | 121 | 31 | 99.9% | 2.9% |
+
+**Conclusion.** 276 of the 278 seizures under 60 s have at least one positive training window (the 2 without are
+under 12 s), so missing labels are not the main reason short seizures are missed. Short seizures do have fewer
+positive windows each, and more of their windows are ambiguous, so they carry less weight in training.
+**Limitation:** this describes labels only; it does not test whether other labelling rules would help.
+
+## 24. Spike and per-channel features (E9)
+
+**Question.** Do the spike-correlation features of Tapani et al. (2019) and per-channel training improve event-level
+detection over the original SVC (A0, feature set 2)?
+
+**Features.** Ten features per channel-window (`helsinki/spike_features.py`), ported from the public MATLAB code:
+SNLEO skewness and regularity, spike count, width and gap, spike-to-spike correlation mean and SD, SNLEO mean and SD,
+and spikiness. They are computed from a second signal of each recording (same electrodes, gaps and montage, 0.5-30 Hz,
+64 Hz) on the same 12 s / 6 s windows, because the MATLAB constants assume 64 Hz. Window level: median, max and p75
+across valid channels (30 columns). Built by `scripts/build_feature_table.py --channel-features --spike-features`.
+
+**Arms** (`modeling/run_channel_models.py`; the RBF SVC of §15 throughout, untuned, trained once):
+
+| Arm | Input | Columns |
+|---|---|---|
+| A0 | window level, feature set 2 (the existing SVC) | 174 |
+| A1 | window level, set 2 + spike | 204 |
+| S | window level, spike only | 30 |
+| C0 | per channel, the 58 set-2 channel features | 58 |
+| C1 | per channel, the 58 features + the 10 spike features | 68 |
+
+Per-channel arms train on (window, channel) rows of valid channels. A row is positive when its window is label 1 and
+the per-channel annotation (`seizure_per_channel_Dec_2017.xlsx`, Tapani et al.) marks that channel in an overlapping
+seizure; every valid channel of a label-0 window is negative; other channels of label-1 windows, and label-1
+windows no spreadsheet row overlaps (mostly seizures only two experts marked), are left out. The spreadsheet has 362
+usable rows from 39 patients; two rows are dropped as data errors (no channel marked, or stop before start). At most
+10,000 positive rows (seed 0) and, inside the SVC, 20,000 negatives are used. A window's score is the maximum over its
+valid channels. Folds, training mask and training-fold-only imputation and scaling are those of §12-15.
+
+**Evaluation.** Event level (§21), postprocessed, thresholds and postprocessing chosen on the other folds.
+Pre-specified: A1, C0 and C1 against A0, majority protocol, 1 FA/h target; success is a sensitivity gain of at least
+5 points whose paired patient-bootstrap 95% CI lies above 0, at a realised FA/h of at most 1.10. Everything else is
+descriptive. Results: `results/event_comparisons.csv`, `event_results.csv`, `event_fold_gains.csv`, `cv_auroc.csv`.
+
+| Arm | AUROC (mean ± SD) | Sensitivity | Under 60 s | FA/h |
+|---|---|---|---|---|
+| A0 | 0.798 ± 0.041 | 33.5% (165 of 492) | 16.5% (46 of 278) | 1.003 |
+| A1 | 0.853 ± 0.027 | 39.8% | 22.7% | 1.021 |
+| S | 0.802 ± 0.044 | 33.5% | 11.9% | 1.094 |
+| C0 | 0.816 ± 0.054 | 35.0% | 13.3% | 0.893 |
+| C1 | 0.886 ± 0.023 | 47.4% (233 of 492) | 19.4% (54 of 278) | 0.966 |
+
+C1 met the pre-specified rule: +13.8 points (CI +1.1 to +26.5). A1 (+6.3, CI -0.0 to +11.5) and C0 (+1.4, CI -6.9 to
++11.1) did not.
+
+**Limitations.**
+
+- **The gain is in seizures of 30 s or longer.** C1 detects 213 of 306 such seizures against A0's 138. Under 30 s it
+  is worse than A0: 20 of 186 (10.8%) against 27 of 186 (14.5%), including 3 against 4 of the 20 seizures under 12 s.
+  The short-seizure (under 60 s) change, +2.9 points, has a CI of -8.5 to +18.6.
+- **One fold and one patient carry much of it.** Fold 3 supplies +54 of the net +68 detected events; fold 4 is worse
+  than A0 (-10). Patient 41 alone gives +26.
+- **Without patient 41 the CI includes 0** (post hoc, evaluation only, nothing re-selected): +9.4 points, CI -0.6 to
+  +20.7.
+- **Not corrected for multiplicity.** Three pre-specified comparisons; C1's lower bound of +1.1 points may not
+  survive a correction.
+- **Cross-fitted, not strictly nested** (§21): the other folds' scores used to choose fold f's threshold come from
+  models trained on fold f's patients, and the threshold grid pools all folds.
+- **Arms differ in more than one way.** C0 and C1 change both the labels (per channel) and the scoring (maximum over
+  channels), so only C1 against C0 isolates the spike features (+12.4 points, CI +5.2 to +22.1, descriptive).
+- **Trained once, untuned.** No repeat runs and no hyperparameter search.
+
+## 25. Causal temporal features (E14)
+
+**Question.** Does temporal context from earlier windows improve detection of short seizures (under 60 s) over C1?
+
+**Features** (`modeling/run_channel_models.py`, `temporal_features`). For each channel and 12 base features of C1
+(line length, RMS amplitude and SNLEO mean on a log scale; spectral entropy, SEF90, Hjorth mobility, SVD entropy,
+0-2 Hz band power, ACF peak, spectral peak prominence, spike count, spike correlation mean), with f(t) the value in
+window t:
+
+| Block | Definition | Columns |
+|---|---|---|
+| B | f(t) minus the median of f over windows t-60 to t-11 (at least 10 usable) | 12 |
+| D2 | f(t) - f(t-2), the previous window that shares no data | 12 |
+| T4 | (f(t) - f(t-4)) / 2, the least-squares slope over t, t-2, t-4 | 12 |
+
+Windows t-1 to t-10 never enter the baseline (a 60 s guard). A window is usable for a channel when it is eligible,
+the channel is valid, and it is not an edge window (the first window, or one after an ineligible or absent window).
+Unusable values stay NaN and are never filled. The features use only past windows of the same patient, and no
+labels, annotations or scores; `tests/test_temporal_features.py` checks that changing later windows never changes
+earlier features. The upstream zero-phase filters can still see about 0.75-1.75 s past a window's end, as for every
+model here. The base features and blocks were chosen before any temporal result.
+
+**Arms.** C1's columns plus temporal blocks, trained exactly as C1 (§24): T-BD (all three blocks, 104 columns) is
+the single pre-specified candidate; T-B (80) and T-D (92) are descriptive ablations and were never chosen between.
+
+**Evaluation.** Event level (§21), postprocessed. Pre-specified: T-BD against C1, majority protocol, 1 FA/h target,
+at matched FA/h (the lower of the two realised FA/h, read off each model's threshold curve, inside every bootstrap
+resample too). Success needs all of: a short-seizure gain of at least 3 points, its 95% CI above 0, T-BD's realised
+FA/h at most 1.10, and the lower bound of the overall difference at least -2 points. Results:
+`results/event_comparisons.csv` (columns ending in `_matched`), `event_results.csv`, `event_fold_gains.csv`.
+
+| Arm | AUROC (mean ± SD) | Majority: sensitivity | Under 60 s | FA/h | Published: sensitivity | FA/h |
+|---|---|---|---|---|---|---|
+| C1 | 0.886 ± 0.023 | 47.4% (233 of 492) | 19.4% (54 of 278) | 0.966 | 75.5% (249 of 330) | 0.928 |
+| T-BD | 0.921 ± 0.015 | 62.6% (308) | 45.0% (125) | 0.985 | 74.8% (247) | 0.938 |
+| T-B | 0.921 ± 0.010 | 65.0% (320) | 46.8% (130) | 1.012 | 79.4% (262) | 0.948 |
+| T-D | 0.902 ± 0.020 | 53.3% (262) | 27.7% (77) | 0.930 | 71.8% (237) | 0.918 |
+
+T-BD met all four criteria: at matched FA/h 0.966, short-seizure gain +25.2 points (CI +1.5 to +46.0), overall
++14.8 (CI -1.5 to +32.5).
+
+**Limitations.** The rule was met, but this is not an established improvement in detecting seizures.
+
+- **Patient 16 supplies most of the gain.** Of T-BD's net +75 detected events, patient 16 (73 short seizures in
+  about 1.6 h) gives +53 (T-B +55 of +87, T-D +15 of +29). Fold 4, which holds patient 16, gives +62 of the +75;
+  fold 3 is worse than C1 (-8). Without patient 16 (post hoc, evaluation only, nothing re-selected), the matched
+  short-seizure gain is +8.5 points with a CI of -0.6 to +21.7, and the overall gain +4.9 (CI -3.7 to +13.4).
+- **The gain is in events only two of three experts marked.** +67 of the +75 (89%) are majority events in which no
+  second was marked by all three experts. These data cannot tell real subtle seizures from a detector firing on
+  ambiguous activity; that needs expert adjudication.
+- **No improvement under the published (all three experts) protocol.** At 1 FA/h T-BD scores 74.8% against C1's
+  75.5% (-0.6 points, CI -7.7 to +9.2); at matched FA/h the overall difference is -0.8 (CI -10.4 to +12.6) and the
+  short-seizure difference +1.8 (CI -11.4 to +22.8). T-B at 0.5 FA/h
+  is the only published-protocol gain whose CI excludes 0 (+10.0, CI +3.0 to +16.9), and it is a descriptive
+  ablation, not a selected model.
+- **Cross-fitted, not strictly nested** (§21), and **trained once**, like C1.
+- **The result builds on C1 (§24)**, whose own gain over A0 depends on fold 3 and patient 41.

@@ -12,9 +12,10 @@ Given a 12-second stretch of a newborn's EEG, is it a seizure? We answer this fo
 12 s window of a recording, with a new window starting every 6 s. A detector like this
 could flag stretches for a clinician to review instead of reading hours of EEG by hand.
 
-Right now we evaluate **window by window**. The question clinicians care about more,
+This walkthrough evaluates **window by window**. The question clinicians care about more,
 whether we catch each seizure *event* and how many false alarms we raise per hour, is
-the next step and is not done yet (see §8).
+answered in `METHODOLOGY.md` §21–25, together with the later experiments (E4, E5, E9,
+E14). How to rerun them is at the end of this file.
 
 ## 2. The data
 
@@ -157,8 +158,8 @@ For each fold we compute two metrics on the test babies' windows that are labell
 We report the mean and standard deviation across the 5 folds.
 
 **Limits we're aware of:**
-- **Window-level only.** We don't yet measure whether each seizure *event* is detected,
-  or how many false alarms happen per hour.
+- **Window-level only.** These scores don't measure whether each seizure *event* is
+  detected, or how many false alarms happen per hour; that is in `METHODOLOGY.md` §21.
 - **Ambiguous windows are excluded from these scores**, so they leave out the hardest
   cases and are probably optimistic.
 - **AUPRC can't be compared between folds**, because the share of seizure windows
@@ -215,7 +216,8 @@ What we take from this:
   confirm identical results.
 
 **Next steps:**
-1. Event-level evaluation: seizures detected, missed, and false alarms per hour.
+1. Event-level evaluation: seizures detected, missed, and false alarms per hour (since
+   done: `METHODOLOGY.md` §21).
 2. Decide how ambiguous windows count in evaluation, and report results with them.
 3. Give the classical models the previous windows' features too, to separate the effect
    of context from the ConvLSTM architecture.
@@ -273,3 +275,48 @@ export HELSINKI_DATA_ROOT="$PWD/data"
 
 Run times are from one Intel Core i5-1038NG7 laptop, CPU only. On a Mac, put
 `caffeinate -i` before long commands and keep the lid open, because sleep pauses the run.
+
+### Event-level evaluation and experiments E4, E5, E9, E14
+
+Methods, results and limitations are in `METHODOLOGY.md` §21–25. These steps need the
+committed prediction files of step 5 (`results/predictions_<model>_set2.parquet`) and
+one more input, `data/annotations/seizure_per_channel_Dec_2017.xlsx` (per-channel
+seizure annotations of Tapani et al., used to label per-channel training rows for E9
+and E14). Every result file listed below is committed, so each step can also be run on
+its own from the committed predictions.
+
+```bash
+# 7. Feature table with per-channel and spike features (E9, E14; replaces step 4's output)
+.venv/bin/python scripts/build_feature_table.py --channel-features --spike-features --n-jobs 4
+
+# 8. E5: label coverage of seizure events (seconds; writes results/label_coverage.csv)
+.venv/bin/python -m modeling.label_analysis
+
+# 9. E4: why seizures are missed (about 8 min; results/missed_seizures.csv,
+#    results/sensitivity_by_duration.csv)
+.venv/bin/python -m modeling.error_analysis
+
+# 10. E9 and E14 arms: A1, S, C0, C1, T-BD, T-B, T-D (about 2.5 h one fold at a time;
+#     results/predictions_SVC_<arm>.parquet, rows added to results/cv_auroc.csv)
+.venv/bin/python -m modeling.run_channel_models
+
+# 11. Event-level results and comparisons for every model (about 40 min with --n-jobs 2;
+#     results/event_*.csv, rows added to sensitivity_by_duration.csv and its chart)
+.venv/bin/python -m modeling.evaluate_events --n-jobs 2
+
+# Tests (synthetic data only)
+.venv/bin/python -m pytest tests
+```
+
+Order: step 7 before 10, and step 10 before 11. Steps 8 and 9 only need the step-5
+predictions. Steps 9 and 11 both write `sensitivity_by_duration.csv`; each replaces only
+its own models' rows, so they can run in either order. `--n-jobs` never changes results:
+the SVC subsamples and the bootstrap use fixed seeds. Step 10 can train one arm with
+`--arms C1`.
+
+The committed results of steps 8–11 were produced with Python 3.13.7, numpy 2.5.4, scipy
+1.18.1, pandas 3.1.1, scikit-learn 1.9.1, mne 1.13.2, PyWavelets 1.8.0, pyarrow 26.0.1,
+matplotlib 3.11.2 and joblib 1.6.0, and match the earlier research implementation
+exactly (retrained scores, threshold choices, results and confidence intervals). Step 7
+was checked on one recording (eeg57), whose rows matched the existing processed files
+exactly; the other 78 recordings were not rebuilt.
