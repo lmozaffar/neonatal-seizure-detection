@@ -1101,3 +1101,61 @@ T-BD met all four criteria: at matched FA/h 0.966, short-seizure gain +25.2 poin
   ablation, not a selected model.
 - **Cross-fitted, not strictly nested** (§21), and **trained once**, like C1.
 - **The result builds on C1 (§24)**, whose own gain over A0 depends on fold 3 and patient 41.
+
+## 26. False-alarm reduction on the original features (Demo II)
+
+**Question.** On the original preprocessing and feature set 2 (§9, §13), without the spike, per-channel or temporal
+features of §24-25, can a different model or training choice detect more seizures at the same false-alarm rate?
+
+**Experiments.** All use the old feature table (no `--spike-features`), the folds of `results/folds.csv` and the
+training mask of §12. Each was trained once, with settings chosen before any result.
+
+| Name | Change | Code |
+|---|---|---|
+| ConvLSTM_pw2 | ConvLSTM (§16) with twice the balanced positive-class weight | `run_convlstm.py --pos-weight 2` |
+| RF_leaf20 | RF (§15) with `min_samples_leaf=20` instead of 5 | `run_fa_models.py` |
+| LightGBM | gradient-boosted trees on the 174 set-2 columns, balanced class weights | `run_fa_models.py` |
+| LightGBM_ctx | LightGBM plus, per column, its mean over the same baby's previous 5 windows (past only) | `run_fa_models.py` |
+
+Imputation is fit inside each training fold. The context features never use the current or a later window (checked
+by changing later windows). AUROC rows: `results/cv_auroc_fa_reduction.csv`.
+
+**Evaluation.** Event level, as in §21: majority protocol, postprocessed, thresholds and postprocessing chosen on
+the other folds for 1 and 0.5 FA/h targets. Computed by `modeling/evaluate_one.py`, which uses `modeling/events.py`
+unchanged and reproduces the SVC row of `event_results.csv` exactly. Results: `results/event_results_<name>.csv`;
+summary with the original models: `results/demo2_summary.csv` (`modeling/demo2_summary.py`).
+
+| Model | AUROC (mean) | 1/h: detected of 492 | FA/h | Under 60 s | 0.5/h: detected | FA/h | Under 60 s |
+|---|---|---|---|---|---|---|---|
+| SVC (A0) | 0.798 | 165 (33.5%) | 1.003 | 46 | 128 (26.0%) | 0.520 | 21 |
+| ConvLSTM | 0.813 | 152 (30.9%) | 0.985 | 30 | 137 (27.8%) | 0.529 | 22 |
+| RF | 0.792 | 131 (26.6%) | 1.222 | 26 | 108 (22.0%) | 0.711 | 12 |
+| ConvLSTM_pw2 | 0.800 | 151 (30.7%) | 1.121 | 26 | 123 (25.0%) | 0.483 | 21 |
+| RF_leaf20 | 0.788 | 120 (24.4%) | 0.957 | 21 | 108 (22.0%) | 0.629 | 14 |
+| LightGBM | 0.803 | **189 (38.4%)** | 1.003 | **60** | 133 (27.0%) | 0.565 | 19 |
+| LightGBM_ctx | 0.821 | 172 (35.0%) | 0.966 | 37 | **148 (30.1%)** | 0.501 | **24** |
+
+**Comparisons** (paired patient bootstrap of §21, 2,000 resamples, seed 0; not matched FA/h):
+
+| Comparison | Sensitivity difference (95% CI) | FA/h difference (95% CI) | Net events |
+|---|---|---|---|
+| LightGBM vs SVC, 1/h | +4.9 points (0.0 to +9.5) | 0.000 (-0.355 to +0.354) | +24, of which patient 16 gives +10 |
+| LightGBM_ctx vs ConvLSTM, 0.5/h | +2.2 points (-3.2 to +6.7) | -0.027 (-0.266 to +0.206) | +11 |
+
+**Conclusion.** LightGBM is the best original-feature model at 1/h and LightGBM_ctx at 0.5/h, but neither gain is
+established: the first interval touches 0, the second includes it. A higher ConvLSTM positive weight and a larger RF
+leaf size did not help.
+
+**Limitations.**
+- **Old preprocessing and features only.** These models are compared with the original set-2 models, not with the
+  arms of §24-25 (C1 detects 233 events and T-BD 308 at 1/h), which use features these models do not have.
+  Combining the two is the next step.
+- **Confidence intervals only for the two rows above.** All other differences in the table are raw counts. The two
+  comparisons were chosen after seeing the results and are not corrected for multiplicity, unlike the pre-specified
+  tests of §24-25.
+- **Cross-fitted, not strictly nested** (§21): absolute sensitivities may be optimistic; comparisons share the bias.
+- **False alarms per day are FA/h × 24.** The FA/h denominator is 109.7 evaluable hours from all 79 babies (the 492
+  events are in 46 of them), and no recording is a day long, so this assumes the hourly rate stays constant over a
+  day.
+- **One training run per model**, no hyperparameter search; realised FA/h can exceed the target (RF, ConvLSTM_pw2
+  at 1/h).
