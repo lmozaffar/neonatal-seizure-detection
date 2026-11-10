@@ -3,6 +3,7 @@
     .venv/bin/python scripts/build_feature_table.py                  # all 79 recordings
     .venv/bin/python scripts/build_feature_table.py --subjects 1 57  # a subset
     .venv/bin/python scripts/build_feature_table.py --channel-features  # also save per-channel features
+    .venv/bin/python scripts/build_feature_table.py --channel-features --spike-features --n-jobs 4  # E9 and E14 inputs
 
 For each recording: load -> preprocess -> make_windows -> assess_windows (quality)
 -> label_windows -> extract_features. Nothing in helsinki/ is changed or
@@ -19,6 +20,13 @@ saved, row-aligned with the table (for models that use the 18-channel layout):
                         are the baseline (Temko) set. NaN where undefined.
   channel_valid.npy     (n_windows, 18) bool: channel has features and is not QC-bad
   channel_index.parquet subject_id, window_index of each row, for checking alignment
+
+With --spike-features, the 10 SNLEO and spike-correlation features of Tapani et al. (2019)
+(helsinki.spike_features, METHODOLOGY.md §24) are computed from a second, 64 Hz 0.5-30 Hz
+signal of the same recording, on the same 12 s / 6 s window grid, and saved row-aligned:
+  spike_channel_features.npy     (n_windows, 18, 10) float32, SPIKE_FEATURES order
+  spike_window_features.parquet  SPIKE_COLUMNS: median, max and p75 across valid channels
+--n-jobs runs the spike features in parallel; the values do not depend on it.
 
 Columns
   identity     subject_id, window_index, start_s, end_s
@@ -55,6 +63,8 @@ from helsinki.labeling import label_windows, load_annotations
 from helsinki.paths import DATA_ROOT, SUBJECT_IDS
 from helsinki.preprocessing import make_windows, preprocess
 from helsinki.quality import assess_windows
+from helsinki.spike_features import (SPIKE_COLUMNS, SPIKE_FEATURES, WIDE_WINDOW_SAMPLES, preprocess_wideband,
+                                     spike_block, spike_window_summary, wide_windows)
 
 OUT_DIR = DATA_ROOT / "processed"
 
@@ -74,9 +84,10 @@ FEATURE_SET_1 = summary_columns("baseline")    # 55 Temko features x 3 stats = 1
 FEATURE_SET_2 = summary_columns("secondary")   # + 3 rhythmicity features x 3 stats = 174
 
 
-def process_recording(subject_id: int, check_baseline: bool = False):
-    """One recording -> (table, channel_feats, channel_valid): one table row per window
-    with the columns described above, and the per-channel features of those windows."""
+def process_recording(subject_id: int, check_baseline: bool = False, spike_features: bool = False, n_jobs: int = 1):
+    """One recording -> (table, channel_feats, channel_valid, spike): one table row per window
+    with the columns described above, the per-channel features of those windows and, with
+    spike_features, their (n_windows, 18, 10) spike features (otherwise None)."""
     raw = load_recording(subject_id, preload=True)
     x, segments = preprocess(raw)
     windows, meta = make_windows(x, subject_id)
@@ -90,7 +101,12 @@ def process_recording(subject_id: int, check_baseline: bool = False):
 
     table = pd.concat([meta.reset_index(drop=True), window_feats], axis=1)
     table = table[ID_COLUMNS + LABEL_COLUMNS + USABILITY_COLUMNS + METADATA_COLUMNS + FEATURE_SET_2]
-    return table, channel_feats.astype(np.float32), channel_valid
+
+    spike = None
+    if spike_features:
+        wide = wide_windows(preprocess_wideband(raw), len(table)).reshape(-1, WIDE_WINDOW_SAMPLES)
+        spike = spike_block(wide, n_jobs=n_jobs).reshape(len(table), 18, len(SPIKE_FEATURES)).astype(np.float32)
+    return table, channel_feats.astype(np.float32), channel_valid, spike
 
 
 def main() -> None:
@@ -101,17 +117,21 @@ def main() -> None:
                         help="also run the baseline feature set and assert it equals the set-1 columns")
     parser.add_argument("--channel-features", action="store_true",
                         help="also save per-channel features (channel_features.npy, channel_valid.npy)")
+    parser.add_argument("--spike-features", action="store_true",
+                        help="also save spike features (spike_channel_features.npy, spike_window_features.parquet)")
+    parser.add_argument("--n-jobs", type=int, default=1, help="processes for the spike features")
     args = parser.parse_args()
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     log_path = args.out.parent / "build_log.txt"
-    tables, chan_feats, chan_valid, failed = [], [], [], []
+    tables, chan_feats, chan_valid, spikes, failed = [], [], [], [], []
     t_all = time.time()
     with open(log_path, "w") as log:
         for i, sid in enumerate(args.subjects, 1):
             t0 = time.time()
             try:
-                table, feats, valid = process_recording(sid, args.check_baseline)
+                table, feats, valid, spike = process_recording(sid, args.check_baseline, args.spike_features,
+                                                               args.n_jobs)
             except Exception as e:
                 failed.append(sid)
                 msg = f"eeg{sid}: FAILED ({type(e).__name__}: {e})"
@@ -119,9 +139,11 @@ def main() -> None:
                 log.write(msg + "\n" + traceback.format_exc() + "\n")
                 continue
             tables.append(table)
+            chan_valid.append(valid)                 # also needed for the spike window summaries
             if args.channel_features:
                 chan_feats.append(feats)
-                chan_valid.append(valid)
+            if args.spike_features:
+                spikes.append(spike)
             msg = (f"eeg{sid}: {len(table)} windows, {int(table.eligible.sum())} eligible, "
                    f"{int(table.unusable.sum())} unusable, {time.time() - t0:.1f} s")
             print(f"[{i}/{len(args.subjects)}] {msg}", flush=True)
@@ -140,12 +162,19 @@ def main() -> None:
         "feature_set_1": FEATURE_SET_1, "feature_set_2": FEATURE_SET_2,
         "rhythmicity_only": [c for c in FEATURE_SET_2 if c not in FEATURE_SET_1],
     }
+    if args.spike_features:
+        columns["spike"] = SPIKE_COLUMNS
     (args.out.parent / "feature_columns.json").write_text(json.dumps(columns, indent=1))
 
     if args.channel_features:
         np.save(args.out.parent / "channel_features.npy", np.concatenate(chan_feats))
         np.save(args.out.parent / "channel_valid.npy", np.concatenate(chan_valid))
         df[["subject_id", "window_index"]].to_parquet(args.out.parent / "channel_index.parquet", index=False)
+    if args.spike_features:
+        spike_channels = np.concatenate(spikes)
+        np.save(args.out.parent / "spike_channel_features.npy", spike_channels)
+        spike_window_summary(spike_channels, np.concatenate(chan_valid)).to_parquet(
+            args.out.parent / "spike_window_features.parquet", index=False)
 
     print(f"\nsaved {args.out} ({len(df)} windows, {df.subject_id.nunique()} subjects) "
           f"in {(time.time() - t_all) / 60:.1f} min")
