@@ -2,11 +2,14 @@
 
     .venv/bin/python -m modeling.run_convlstm                                       # all folds, both sets
     .venv/bin/python -m modeling.run_convlstm --folds 0 --sets set2 --max-epochs 5 --out-dir results/test
+    .venv/bin/python -m modeling.run_convlstm --sets set2 --pos-weight 2 --name ConvLSTM_pw2 \
+        --cv-file cv_auroc_fa_reduction.csv                                      # 2x the balanced weight
 
 Same folds (results/folds.csv), training mask and output format as
-modeling/run_experiments.py: rows with model="ConvLSTM" in cv_auroc.csv and
-predictions_ConvLSTM_set<N>.parquet. Also writes convlstm_history.csv (loss and
-validation AUROC per epoch) and convlstm_curves.png.
+modeling/run_experiments.py: rows with model=<name> (default "ConvLSTM") in
+cv_auroc.csv (or --cv-file) and predictions_<name>_set<N>.parquet. Also writes
+<name>_history.csv (loss and validation AUROC per epoch) and <name>_curves.png,
+lower-cased (convlstm_history.csv and convlstm_curves.png by default).
 
 Input. Needs data/processed/channel_features.npy from
 `scripts/build_feature_table.py --channel-features`: Leila's per-channel features,
@@ -32,7 +35,8 @@ the valid channel-windows of the training patients only, then applied to every
 window. Many features (powers, energies) span orders of magnitude; a rank
 transform makes them comparable without being dominated by outliers.
 
-Training. Weighted BCE (pos_weight = negatives/positives among training targets);
+Training. Weighted BCE (pos_weight = negatives/positives among training targets,
+times --pos-weight, default 1);
 Adam; early stopping on the AUROC of a validation split of the TRAINING patients
 (VAL_FRACTION of the seizure and of the non-seizure subjects), never the test fold.
 
@@ -204,8 +208,11 @@ def predict(model, x_all, seq, rows, batch: int = 2048) -> np.ndarray:
     return to_numpy(torch.cat(out)) if out else np.empty(0)
 
 
-def run_fold(df, feats, valid, seq, set_name: str, fold: int, max_epochs: int):
-    """Train on the other folds' patients, return (held-out predictions, history rows, fit seconds)."""
+def run_fold(df, feats, valid, seq, set_name: str, fold: int, max_epochs: int, pos_weight_scale: float = 1.0):
+    """Train on the other folds' patients, return (held-out predictions, history rows, fit seconds).
+
+    The positive-class weight is negatives/positives among the training targets times pos_weight_scale.
+    """
     torch.manual_seed(RANDOM_STATE + fold)
     f = feats[:, :, SET_FEATURES[set_name]]
     train_ok = training_mask(df).to_numpy()
@@ -221,7 +228,7 @@ def run_fold(df, feats, valid, seq, set_name: str, fold: int, max_epochs: int):
     x_all = scaled_inputs(f, valid, tr_rows)
     y_t = to_torch(y.astype(np.float32))
     n_pos = int((y[tr_rows] == 1).sum())
-    pos_weight = torch.tensor((len(tr_rows) - n_pos) / n_pos)
+    pos_weight = torch.tensor(pos_weight_scale * (len(tr_rows) - n_pos) / n_pos)
     loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     model = ConvLSTM(x_all.shape[-1])
     opt = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
@@ -229,8 +236,8 @@ def run_fold(df, feats, valid, seq, set_name: str, fold: int, max_epochs: int):
     tr_t, va_t = to_torch(tr_rows, torch.int64), to_torch(va_rows, torch.int64)
     gen = torch.Generator().manual_seed(RANDOM_STATE + fold)
     print(f"  {set_name} fold {fold}: train {len(tr_rows)} targets ({n_pos} pos) from {len(np.unique(df.subject_id.to_numpy()[tr_rows]))} "
-          f"patients | val {len(va_rows)} targets from {len(val_subjects)} patients | test {len(test_rows)} windows",
-          flush=True)
+          f"patients | val {len(va_rows)} targets from {len(val_subjects)} patients | test {len(test_rows)} windows "
+          f"| pos_weight {pos_weight.item():.2f}", flush=True)
 
     history, best_auc, best_state, stale = [], -np.inf, None, 0
     for epoch in range(1, max_epochs + 1):
@@ -267,8 +274,7 @@ def run_fold(df, feats, valid, seq, set_name: str, fold: int, max_epochs: int):
     return held_out, history, t_fit
 
 
-def save_history(history: list[dict], out_dir) -> pd.DataFrame:
-    path = out_dir / "convlstm_history.csv"
+def save_history(history: list[dict], path) -> pd.DataFrame:
     new = pd.DataFrame(history)
     if path.exists():
         old = pd.read_csv(path)
@@ -306,8 +312,13 @@ def main() -> None:
     parser.add_argument("--folds", type=int, nargs="+", default=list(range(N_SPLITS)))
     parser.add_argument("--max-epochs", type=int, default=MAX_EPOCHS)
     parser.add_argument("--out-dir", type=Path, default=RESULTS_DIR)
+    parser.add_argument("--pos-weight", type=float, default=1.0,
+                        help="multiplier on the balanced positive-class weight (negatives/positives); 1 = unchanged")
+    parser.add_argument("--name", default="ConvLSTM", help="model name in outputs and their file names")
+    parser.add_argument("--cv-file", default="cv_auroc.csv", help="file in --out-dir for the AUROC/AUPRC rows")
     args = parser.parse_args()
     args.out_dir.mkdir(parents=True, exist_ok=True)
+    stem = args.name.lower()
 
     df, feats, valid = load_data()
     seq = sequence_index(df)
@@ -319,21 +330,21 @@ def main() -> None:
         t_set = time.time()
         for fold in args.folds:
             t0 = time.time()
-            held_out, hist, t_fit = run_fold(df, feats, valid, seq, set_name, fold, args.max_epochs)
+            held_out, hist, t_fit = run_fold(df, feats, valid, seq, set_name, fold, args.max_epochs, args.pos_weight)
             t_pred = time.time() - t0 - t_fit
-            row = evaluate(held_out, set_name, "ConvLSTM", fold)
+            row = evaluate(held_out, set_name, args.name, fold)
             rows.append({**row, "fit_s": round(t_fit, 1), "predict_s": round(t_pred, 1)})
             predictions.append(held_out[PREDICTION_COLUMNS])
             history.extend(hist)
             best = max(hist, key=lambda h: h["val_auroc"])
-            print(f"ConvLSTM {set_name} fold {fold}: AUROC {row['auroc']:.3f}  AUPRC {row['auprc']:.3f}  "
+            print(f"{args.name} {set_name} fold {fold}: AUROC {row['auroc']:.3f}  AUPRC {row['auprc']:.3f}  "
                   f"(best epoch {best['epoch']}, val AUROC {best['val_auroc']:.3f})  "
                   f"fold time {(time.time() - t0) / 60:.1f} min\n", flush=True)
         pd.concat(predictions).sort_values(["subject_id", "start_s"]).to_parquet(
-            args.out_dir / f"predictions_ConvLSTM_{set_name}.parquet", index=False)
-        save_cv_rows(rows, args.out_dir)
-        plot_history(save_history(history, args.out_dir), args.out_dir / "convlstm_curves.png")
-        print(f"ConvLSTM {set_name} done in {(time.time() - t_set) / 60:.1f} min\n", flush=True)
+            args.out_dir / f"predictions_{args.name}_{set_name}.parquet", index=False)
+        save_cv_rows(rows, args.out_dir, args.cv_file)
+        plot_history(save_history(history, args.out_dir / f"{stem}_history.csv"), args.out_dir / f"{stem}_curves.png")
+        print(f"{args.name} {set_name} done in {(time.time() - t_set) / 60:.1f} min\n", flush=True)
 
 
 if __name__ == "__main__":
