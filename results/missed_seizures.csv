@@ -1,0 +1,25 @@
+model,operating_point,outcome,n_missed,share_of_missed
+ConvLSTM,baseline,"crossed, too short",0,0.0
+ConvLSTM,baseline,near miss (>= p99),78,0.1964735516372796
+ConvLSTM,baseline,elevated (p90-p99),144,0.36272040302267
+ConvLSTM,baseline,low (< p90),175,0.44080604534005036
+ConvLSTM,postprocessed,"crossed, too short",38,0.11176470588235295
+ConvLSTM,postprocessed,near miss (>= p99),7,0.020588235294117647
+ConvLSTM,postprocessed,elevated (p90-p99),104,0.3058823529411765
+ConvLSTM,postprocessed,low (< p90),191,0.5617647058823529
+SVC,baseline,"crossed, too short",0,0.0
+SVC,baseline,near miss (>= p99),68,0.18579234972677597
+SVC,baseline,elevated (p90-p99),188,0.5136612021857924
+SVC,baseline,low (< p90),110,0.3005464480874317
+SVC,postprocessed,"crossed, too short",42,0.12844036697247707
+SVC,postprocessed,near miss (>= p99),3,0.009174311926605505
+SVC,postprocessed,elevated (p90-p99),108,0.3302752293577982
+SVC,postprocessed,low (< p90),174,0.5321100917431193
+RF,baseline,"crossed, too short",0,0.0
+RF,baseline,near miss (>= p99),66,0.16793893129770993
+RF,baseline,elevated (p90-p99),203,0.5165394402035624
+RF,baseline,low (< p90),124,0.3155216284987277
+RF,postprocessed,"crossed, too short",16,0.0443213296398892
+RF,postprocessed,near miss (>= p99),9,0.024930747922437674
+RF,postprocessed,elevated (p90-p99),140,0.3878116343490305
+RF,postprocessed,low (< p90),196,0.5429362880886427
